@@ -103,28 +103,28 @@
       background: #f6f669 !important;
     }
 
-    #board .square-55d63.legal-move-dot::after,
-    #board .square-55d63.legal-move-capture::after {
+    #board .legal-move-dot,
+    #board .legal-move-capture {
       position: absolute;
-      z-index: 2;
+      z-index: 10;
       top: 50%;
       left: 50%;
       border-radius: 50%;
-      content: "";
       pointer-events: none;
       transform: translate(-50%, -50%);
     }
 
-    #board .square-55d63.legal-move-dot::after {
-      width: 28%;
-      height: 28%;
-      background: rgb(70 75 82 / 42%);
+    #board .legal-move-dot {
+      width: 14px;
+      height: 14px;
+      background: rgba(0, 0, 0, 0.25);
     }
 
-    #board .square-55d63.legal-move-capture::after {
-      width: 88%;
-      height: 88%;
-      border: max(4px, 0.45vw) solid rgb(70 75 82 / 42%);
+    #board .legal-move-capture {
+      width: 80%;
+      height: 80%;
+      border: 4px solid rgba(0, 0, 0, 0.25);
+      box-sizing: border-box;
     }
 
     .player-card {
@@ -442,6 +442,8 @@
     let playerColor = "w";
     let selectedSquare = null;
     let selectedLegalMoves = [];
+    let activeTouch = null;
+    let ignoreClickUntil = 0;
 
     const board = Chessboard("board", {
       position: "start",
@@ -458,14 +460,16 @@
     });
 
     function clearSelection() {
-      document.querySelectorAll(
-        "#board .click-selected, #board .legal-move-dot, #board .legal-move-capture"
-      ).forEach((square) => {
-        square.classList.remove(
-          "click-selected",
-          "legal-move-dot",
-          "legal-move-capture"
-        );
+      const boardElement = document.getElementById("board");
+      boardElement.querySelectorAll(
+        ".click-selected, .legal-move-dot, .legal-move-capture"
+      ).forEach((element) => {
+        if (element.classList.contains("legal-move-dot") ||
+            element.classList.contains("legal-move-capture")) {
+          element.remove();
+        } else {
+          element.classList.remove("click-selected");
+        }
       });
       selectedSquare = null;
       selectedLegalMoves = [];
@@ -497,9 +501,12 @@
         const isCapture =
           (targetPiece && targetPiece.color !== playerColor) ||
           move.flags.includes("e");
-        target.classList.add(
-          isCapture ? "legal-move-capture" : "legal-move-dot"
-        );
+        const indicator = document.createElement("div");
+        indicator.className = isCapture
+          ? "legal-move-capture"
+          : "legal-move-dot";
+        indicator.setAttribute("aria-hidden", "true");
+        target.appendChild(indicator);
       });
     }
 
@@ -570,18 +577,34 @@
       return true;
     }
 
-    document.getElementById("board").addEventListener(
+    const boardElement = document.getElementById("board");
+
+    boardElement.addEventListener(
       "touchmove",
-      (event) => event.preventDefault(),
+      (event) => {
+        event.preventDefault();
+        if (activeTouch && event.touches.length) {
+          const touch = event.touches[0];
+          if (Math.hypot(
+            touch.clientX - activeTouch.startX,
+            touch.clientY - activeTouch.startY
+          ) > 8) {
+            activeTouch.moved = true;
+          }
+        }
+      },
       { passive: false }
     );
-    document.getElementById("board").addEventListener("click", (event) => {
+
+    function handleBoardSelection(event) {
       if (waitingForEngine || promotionResolver) {
         return;
       }
 
-      const square = squareFromElement(event.target.closest(".square-55d63"));
+      const squareElement = event.target.closest(".square-55d63");
+      const square = squareFromElement(squareElement);
       if (!square) {
+        clearSelection();
         return;
       }
 
@@ -593,18 +616,58 @@
         return;
       }
 
-      if (selectedSquare) {
-        clearSelection();
-        return;
-      }
-
       const piece = game.get(square);
       if (piece && piece.color === playerColor && game.turn() === playerColor) {
         selectSquare(square);
       } else {
         clearSelection();
       }
+    }
+
+    boardElement.addEventListener("click", (event) => {
+      if (Date.now() < ignoreClickUntil) {
+        event.preventDefault();
+        return;
+      }
+      handleBoardSelection(event);
     });
+
+    boardElement.addEventListener("touchstart", (event) => {
+      if (event.touches.length !== 1) {
+        activeTouch = null;
+        return;
+      }
+      const touch = event.touches[0];
+      activeTouch = {
+        square: squareFromElement(event.target.closest(".square-55d63")),
+        startX: touch.clientX,
+        startY: touch.clientY,
+        moved: false
+      };
+    }, { passive: true });
+
+    boardElement.addEventListener("touchend", (event) => {
+      if (!activeTouch) {
+        return;
+      }
+      const touch = activeTouch;
+      activeTouch = null;
+      if (touch.moved) {
+        ignoreClickUntil = Date.now() + 500;
+        return;
+      }
+
+      const squareElement = event.target.closest(".square-55d63");
+      const square = squareFromElement(squareElement);
+      if (square && square === touch.square) {
+        ignoreClickUntil = Date.now() + 500;
+        handleBoardSelection(event);
+      }
+    }, { passive: true });
+
+    boardElement.addEventListener("touchcancel", () => {
+      activeTouch = null;
+    }, { passive: true });
 
     function setStatus(message, isError) {
       statusElement.textContent = message;
