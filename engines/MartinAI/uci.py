@@ -1,4 +1,4 @@
-"""UCI protocol adapter for Martin ONNX anchors and PyTorch checkpoints."""
+"""UCI protocol adapter for Martin ONNX models."""
 
 from __future__ import annotations
 
@@ -72,25 +72,7 @@ def _runtime_paths() -> tuple[
             if Path(location).is_dir()
         )
 
-    for capi_dir in onnxruntime_dirs:
-        if capi_dir.parent.name == "capi":
-            runtime_roots.add(capi_dir.parent.parent)
-
     dll_dirs: set[Path] = set(onnxruntime_dirs | rust_package_dirs)
-    for root in runtime_roots:
-        for relative in (
-            Path("torch") / "lib",
-        ):
-            candidate = root / relative
-            if candidate.is_dir():
-                dll_dirs.add(candidate.resolve())
-        nvidia_root = root / "nvidia"
-        if nvidia_root.is_dir():
-            dll_dirs.update(
-                path.resolve()
-                for path in nvidia_root.rglob("*")
-                if path.is_dir() and path.name.lower() in {"bin", "lib"}
-            )
     return (
         project_root,
         executable_dir,
@@ -167,9 +149,7 @@ def _model_candidates(
             project_root / "_internal" / "exports" / "model.onnx",
             executable_dir / "_internal" / "exports" / "model_anchor.onnx",
             executable_dir / "model_anchor.onnx",
-            executable_dir / "latest_model.pt",
             project_root / "exports" / "model_anchor.onnx",
-            project_root / "build" / "latest_model.pt",
         )
     )
     return tuple(dict.fromkeys(candidate.resolve() for candidate in candidates))
@@ -183,10 +163,10 @@ DEFAULT_MODEL_CANDIDATES = _model_candidates(
 )
 
 import chess
-import torch
+import numpy as np
+import onnxruntime as ort
 
 from src.mcts import MCTS
-from src.persistence import load_archived_model
 
 
 HARD_SEARCH_TIME_SECONDS = 5.0
@@ -206,7 +186,7 @@ def resolve_model_path(path: str | Path | None = None) -> Path:
             return candidate.resolve()
     searched = "\n".join(f"  - {candidate}" for candidate in DEFAULT_MODEL_CANDIDATES)
     raise FileNotFoundError(
-        f"ONNX/checkpoint model not found. Expected {MODEL_PATH} or one of:\n{searched}"
+        f"ONNX model not found. Expected {MODEL_PATH} or one of:\n{searched}"
     )
 
 
@@ -312,16 +292,14 @@ class MartinUCI:
     def __init__(
         self,
         model_path: Path | None = None,
-        device_option: str = "auto",
         simulations: int = 128,
     ) -> None:
         if simulations < 1:
             raise ValueError("MCTS simulations must be positive.")
         self.model_path = resolve_model_path(model_path)
-        self.device_option = device_option
         self.simulations = simulations
-        self.device = torch.device("cpu")
-        self.model: torch.nn.Module | None = None
+        self.onnx_session: ort.InferenceSession | None = None
+        self.inference_fn: Any = None
         self.search: MCTS | None = None
         self.board = chess.Board()
         self._output_lock = threading.Lock()
@@ -338,50 +316,54 @@ class MartinUCI:
             return
         if not self.model_path.is_file():
             raise FileNotFoundError(f"Model file not found: {self.model_path}")
-        if self.model_path.suffix.lower() == ".onnx":
-            self.search = MCTS(
-                None,
-                torch.device("cpu"),
-                simulations=self.simulations,
-                tactical_checks=False,
-                rust_model_path=self.model_path,
+        if self.model_path.suffix.lower() != ".onnx":
+            raise ValueError(
+                f"UCI inference requires an ONNX model, got: {self.model_path}"
             )
-            self.device = torch.device("cpu")
-            return
-        if self.device_option == "auto":
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            device = torch.device(self.device_option)
-        if device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"CUDA device {device} requested, but CUDA is unavailable.")
-        model, _ = load_archived_model(self.model_path, device)
-        self.model = model
-        self.device = device
+
+        options = ort.SessionOptions()
+        options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        )
+        options.intra_op_num_threads = 2
+        self.onnx_session = ort.InferenceSession(
+            str(self.model_path.resolve()),
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        session = self.onnx_session
+        input_name = session.get_inputs()[0].name
+        output_names = [output.name for output in session.get_outputs()]
+
+        def infer(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            outputs = session.run(
+                output_names,
+                {input_name: np.asarray(features, dtype=np.float32)},
+            )
+            return (
+                np.asarray(outputs[0], dtype=np.float32),
+                np.asarray(outputs[1], dtype=np.float32).reshape(-1),
+            )
+
+        self.inference_fn = infer
+        self.search = self._create_search()
+
+    def _create_search(self) -> MCTS:
+        if self.inference_fn is None:
+            raise RuntimeError("ONNX inference session is not initialized.")
         self.search = MCTS(
-            model,
-            device,
+            None,
+            "cpu",
             simulations=self.simulations,
+            inference_fn=self.inference_fn,
             tactical_checks=False,
         )
+        return self.search
 
     def _new_game(self) -> None:
         self.board = chess.Board()
         if self.search is not None:
-            if self.model_path.suffix.lower() == ".onnx":
-                self.search = MCTS(
-                    None,
-                    torch.device("cpu"),
-                    simulations=self.simulations,
-                    tactical_checks=False,
-                    rust_model_path=self.model_path,
-                )
-            elif self.model is not None:
-                self.search = MCTS(
-                    self.model,
-                    self.device,
-                    simulations=self.simulations,
-                    tactical_checks=False,
-                )
+            self._create_search()
 
     def _finish_search(self, command: str) -> None:
         position = self.board.copy(stack=True)
@@ -442,8 +424,8 @@ class MartinUCI:
             if not self._suppress_bestmove.is_set():
                 self._emit(f"bestmove {bestmove}")
         except Exception as e:
-            print(f"[ERROR] MCTS search failed: {e}", file=sys.stderr)
-            print(traceback.format_exc(), file=sys.stderr)
+            print(f"[CRITICAL MCTS ERROR] {e}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
             sys.stderr.flush()
             bestmove = fallback_move
             self._emit(f"info string error: {e}")
@@ -517,19 +499,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MartinAI UCI chess engine")
     parser.add_argument(
         "--model-path",
-        "--checkpoint",
         dest="model_path",
         type=Path,
         default=None,
         help=(
-            "Model file; default priority: local model_anchor.onnx, "
-            "local latest_model.pt, exports/model_anchor.onnx"
+            "ONNX model file; defaults to a local model_anchor.onnx or model.onnx"
         ),
-    )
-    parser.add_argument(
-        "--device",
-        default="auto",
-        help="Inference device for .pt models: auto, cpu, cuda, or cuda:N",
     )
     parser.add_argument(
         "--simulations",
@@ -543,7 +518,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        engine = MartinUCI(args.model_path, args.device, args.simulations)
+        engine = MartinUCI(args.model_path, args.simulations)
         engine.run()
     except Exception as error:
         print(f"MartinAI startup failed: {error}", file=sys.stderr, flush=True)

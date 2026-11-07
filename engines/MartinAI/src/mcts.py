@@ -1,75 +1,16 @@
 from __future__ import annotations
 
-import os
-import shutil
-import sys
-from pathlib import Path
-
-from tqdm.auto import tqdm
-
-
-_DLL_DIRECTORY_HANDLES = []
-_EXCLUDED_DLL_MARKERS = (
-    "torch",
-    "c10",
-    "shm",
-    "asmjit",
-    "fbgemm",
-    "nvfuser",
-)
-
-
-def _preload_cuda_dlls() -> None:
-    if sys.platform != "win32":
-        return
-
-    project_root = Path(__file__).resolve().parents[1]
-    site_packages = project_root / ".venv" / "Lib" / "site-packages"
-    nvidia_dir = site_packages / "nvidia"
-    torch_lib = site_packages / "torch" / "lib"
-    package_dir = project_root / "rust_mcts" / "python" / "rust_mcts"
-    package_dir.mkdir(parents=True, exist_ok=True)
-
-    source_dirs = []
-    if nvidia_dir.is_dir():
-        source_dirs.append(nvidia_dir)
-    if torch_lib.is_dir():
-        source_dirs.append(torch_lib)
-
-    for source_dir in source_dirs:
-        dll_paths = (
-            source_dir.rglob("*.dll")
-            if source_dir == nvidia_dir
-            else source_dir.glob("*.dll")
-        )
-        for source in dll_paths:
-            if any(marker in source.name.lower() for marker in _EXCLUDED_DLL_MARKERS):
-                continue
-            destination = package_dir / source.name
-            if (
-                not destination.is_file()
-                or source.stat().st_size != destination.stat().st_size
-            ):
-                shutil.copy2(source, destination)
-
-    package_path = str(package_dir.resolve())
-    os.environ["PATH"] = package_path + os.path.pathsep + os.environ.get("PATH", "")
-    _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(package_path))
-
-
-_preload_cuda_dlls()
-
 import math
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-import time
+from pathlib import Path
+from typing import Any
 
 import chess
 import numpy as np
-import torch
 
 from .encoding import ACTION_SIZE, encode_board, move_to_action
-from .network import ChessNetwork
 
 try:
     from rust_mcts._rust_mcts import RustMCTS as _RustMCTS
@@ -125,8 +66,8 @@ class SearchNode:
 class MCTS:
     def __init__(
         self,
-        model: ChessNetwork | None,
-        device: torch.device,
+        model: Any | None,
+        device: Any,
         simulations: int = 64,
         c_puct: float = 1.5,
         dirichlet_alpha: float = 0.3,
@@ -152,17 +93,14 @@ class MCTS:
             raise ValueError("value_discount must be in (0, 1].")
         if model is None and inference_fn is None and _RustMCTS is None:
             raise ValueError("MCTS requires a model or an inference callback.")
-        if device.type == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(
-                "MCTS was configured for CUDA, but this PyTorch installation "
-                "cannot access CUDA."
-            )
         if rust_model_path is not None and _RustMCTS is None:
             raise RuntimeError(
                 "An ONNX model path was provided, but the Rust MCTS extension "
                 "is unavailable."
             )
-        if rust_model_path is not None and _RustMCTS is not None:
+        if inference_fn is not None:
+            self._rust_backend = None
+        elif rust_model_path is not None and _RustMCTS is not None:
             self._rust_backend = _RustMCTS(str(rust_model_path))
         else:
             self._rust_backend = _RustMCTS() if _RustMCTS is not None else None
@@ -176,6 +114,8 @@ class MCTS:
         self.noise_fraction = noise_fraction
         self.repetition_penalty = repetition_penalty
         self.inference_fn = inference_fn
+        self.evaluation_cache: dict[str, tuple[np.ndarray, float]] = {}
+        self._evaluation_cache_max_entries = 256
         self.tactical_checks = tactical_checks
         self.value_discount = value_discount
         self.retain_search_tree = retain_search_tree
@@ -193,8 +133,43 @@ class MCTS:
     ) -> tuple[np.ndarray, np.ndarray]:
         if not boards:
             raise ValueError("Cannot predict an empty batch of chess positions.")
-        features = np.stack([encode_board(board) for board in boards])
-        return self._predict_features(features)
+        positions_by_fen: dict[str, list[int]] = {}
+        for index, board in enumerate(boards):
+            positions_by_fen.setdefault(board.fen(), []).append(index)
+
+        probabilities = np.empty(
+            (len(boards), ACTION_SIZE), dtype=np.float32
+        )
+        values = np.empty(len(boards), dtype=np.float32)
+        missing_fens: list[str] = []
+        missing_boards: list[chess.Board] = []
+        for fen, indices in positions_by_fen.items():
+            cached = self.evaluation_cache.get(fen)
+            if cached is None:
+                missing_fens.append(fen)
+                missing_boards.append(boards[indices[0]])
+                continue
+            cached_probabilities, cached_value = cached
+            for index in indices:
+                probabilities[index] = cached_probabilities
+                values[index] = cached_value
+
+        if missing_boards:
+            features = np.stack([encode_board(board) for board in missing_boards])
+            inferred_probabilities, inferred_values = self._predict_features(features)
+            for batch_index, fen in enumerate(missing_fens):
+                cached_value = float(inferred_values[batch_index])
+                cached_probabilities = inferred_probabilities[batch_index].copy()
+                if len(self.evaluation_cache) >= self._evaluation_cache_max_entries:
+                    self.evaluation_cache.pop(next(iter(self.evaluation_cache)))
+                self.evaluation_cache[fen] = (
+                    cached_probabilities,
+                    cached_value,
+                )
+                for index in positions_by_fen[fen]:
+                    probabilities[index] = cached_probabilities
+                    values[index] = cached_value
+        return probabilities, values
 
     def _predict_features(
         self, features: np.ndarray
@@ -211,26 +186,12 @@ class MCTS:
             return probabilities, values.reshape(-1)
         if self.model is None:
             raise RuntimeError("MCTS model is unavailable for local inference.")
-        model_device = next(self.model.parameters()).device
-        if model_device.type != self.device.type:
+        predict_numpy = getattr(self.model, "predict_numpy", None)
+        if not callable(predict_numpy):
             raise RuntimeError(
-                "MCTS model device type does not match the configured device: "
-                f"configured={self.device.type}, model={model_device.type}."
+                "MCTS models must provide a predict_numpy() inference method."
             )
-        tensors = torch.from_numpy(features).to(
-            model_device, non_blocking=model_device.type == "cuda"
-        )
-        with torch.no_grad():
-            if model_device.type == "cuda":
-                with torch.autocast(device_type="cuda", dtype=torch.float16):
-                    logits, values = self.model(tensors)
-            else:
-                logits, values = self.model(tensors)
-            probabilities = torch.softmax(logits.float(), dim=1)
-        return (
-            probabilities.cpu().numpy(),
-            values.float().reshape(-1).cpu().numpy(),
-        )
+        return predict_numpy(features, self.device)
 
     @staticmethod
     def _terminal_value(board: chess.Board) -> float:
@@ -535,13 +496,6 @@ class MCTS:
                 history.append(historical_board.fen(en_passant="fen"))
             histories.append(history)
 
-        if not self._rust_search_diagnostics_printed:
-            tqdm.write(
-                "[RustMCTS] search_batch parameters: "
-                f"roots={len(fens)}, num_simulations={self.simulations}, "
-                "return_policy=False"
-            )
-            self._rust_search_diagnostics_printed = True
         rust_results = self._rust_backend.search_batch(
             fens,
             histories,

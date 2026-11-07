@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -63,3 +64,33 @@ class ChessNetwork(nn.Module):
         policy = policy.permute(0, 2, 3, 1).reshape(batch_size, ACTION_SIZE)
         value = self.value_head(features).squeeze(-1)
         return policy, value
+
+    def predict_numpy(
+        self,
+        features: np.ndarray,
+        configured_device: torch.device | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Run inference for MCTS and return policy/value arrays as NumPy."""
+        model_device = next(self.parameters()).device
+        if (
+            configured_device is not None
+            and model_device.type != configured_device.type
+        ):
+            raise RuntimeError(
+                "MCTS model device type does not match the configured device: "
+                f"configured={configured_device.type}, model={model_device.type}."
+            )
+        tensors = torch.from_numpy(np.asarray(features, dtype=np.float32)).to(
+            model_device, non_blocking=model_device.type == "cuda"
+        )
+        with torch.no_grad():
+            if model_device.type == "cuda":
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
+                    logits, values = self(tensors)
+            else:
+                logits, values = self(tensors)
+            probabilities = torch.softmax(logits.float(), dim=1)
+        return (
+            probabilities.cpu().numpy(),
+            values.float().reshape(-1).cpu().numpy(),
+        )
