@@ -90,6 +90,41 @@
     #board {
       width: 100%;
       margin: 0 auto;
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+
+    #board .square-55d63 {
+      position: relative;
+    }
+
+    #board .square-55d63.click-selected {
+      background: #f6f669 !important;
+    }
+
+    #board .square-55d63.legal-move-dot::after,
+    #board .square-55d63.legal-move-capture::after {
+      position: absolute;
+      z-index: 2;
+      top: 50%;
+      left: 50%;
+      border-radius: 50%;
+      content: "";
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+    }
+
+    #board .square-55d63.legal-move-dot::after {
+      width: 28%;
+      height: 28%;
+      background: rgb(70 75 82 / 42%);
+    }
+
+    #board .square-55d63.legal-move-capture::after {
+      width: 88%;
+      height: 88%;
+      border: max(4px, 0.45vw) solid rgb(70 75 82 / 42%);
     }
 
     .player-card {
@@ -263,6 +298,44 @@
         padding: 18px;
       }
     }
+
+    @media (max-width: 768px) {
+      body {
+        display: block;
+        padding: 8px 0;
+      }
+
+      main {
+        width: 100%;
+        padding: 12px max(5vw, 12px);
+        border: 0;
+        border-radius: 0;
+        box-shadow: none;
+      }
+
+      .hint {
+        margin-bottom: 14px;
+      }
+
+      .settings {
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+
+      #board {
+        width: min(100%, 90vw);
+      }
+
+      .player-card {
+        gap: 9px;
+        min-height: 52px;
+        padding: 5px 0;
+      }
+
+      #status {
+        margin-top: 12px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -367,6 +440,8 @@
     let promotionResolver = null;
     let waitingForEngine = false;
     let playerColor = "w";
+    let selectedSquare = null;
+    let selectedLegalMoves = [];
 
     const board = Chessboard("board", {
       position: "start",
@@ -379,6 +454,155 @@
       onDrop: onDrop,
       onSnapEnd: function () {
         board.position(game.fen());
+      }
+    });
+
+    function clearSelection() {
+      document.querySelectorAll(
+        "#board .click-selected, #board .legal-move-dot, #board .legal-move-capture"
+      ).forEach((square) => {
+        square.classList.remove(
+          "click-selected",
+          "legal-move-dot",
+          "legal-move-capture"
+        );
+      });
+      selectedSquare = null;
+      selectedLegalMoves = [];
+    }
+
+    function selectSquare(square) {
+      clearSelection();
+      const piece = game.get(square);
+      if (!piece || piece.color !== playerColor || game.turn() !== playerColor ||
+          waitingForEngine || game.game_over()) {
+        return;
+      }
+
+      selectedSquare = square;
+      selectedLegalMoves = game.moves({ square: square, verbose: true });
+      const selectedElement = document.querySelector(
+        "#board .square-" + square
+      );
+      if (selectedElement) {
+        selectedElement.classList.add("click-selected");
+      }
+
+      selectedLegalMoves.forEach((move) => {
+        const target = document.querySelector("#board .square-" + move.to);
+        if (!target) {
+          return;
+        }
+        const targetPiece = game.get(move.to);
+        const isCapture =
+          (targetPiece && targetPiece.color !== playerColor) ||
+          move.flags.includes("e");
+        target.classList.add(
+          isCapture ? "legal-move-capture" : "legal-move-dot"
+        );
+      });
+    }
+
+    function squareFromElement(element) {
+      if (!element) {
+        return null;
+      }
+      const squareClass = Array.from(element.classList).find((className) =>
+        /^square-[a-h][1-8]$/.test(className)
+      );
+      return squareClass ? squareClass.substring(7) : null;
+    }
+
+    function isPromotionMove(source, target) {
+      const piece = game.get(source);
+      return Boolean(
+        piece &&
+        piece.type === "p" &&
+        ((piece.color === "w" && target.charAt(1) === "8") ||
+          (piece.color === "b" && target.charAt(1) === "1")) &&
+        game.moves({ square: source, verbose: true }).some((move) =>
+          move.to === target && Boolean(move.promotion)
+        )
+      );
+    }
+
+    function completePlayerMove(source, target, promotion) {
+      const previousFen = game.fen();
+      const move = game.move({
+        from: source,
+        to: target,
+        promotion: promotion || "q"
+      });
+      if (!move) {
+        clearSelection();
+        board.position(game.fen());
+        return;
+      }
+
+      clearSelection();
+      board.position(game.fen());
+      fenElement.textContent = game.fen();
+      renderPlayerInfo();
+      if (game.game_over()) {
+        finishGame();
+      } else {
+        requestEngineMove(previousFen);
+      }
+    }
+
+    function attemptSelectedMove(target) {
+      const matchingMove = selectedLegalMoves.find((move) => move.to === target);
+      if (!matchingMove || !selectedSquare) {
+        return false;
+      }
+
+      const source = selectedSquare;
+      clearSelection();
+      if (matchingMove.promotion) {
+        showPromotionPicker(playerColor).then((promotion) => {
+          if (promotion && !waitingForEngine) {
+            completePlayerMove(source, target, promotion);
+          }
+        });
+      } else {
+        completePlayerMove(source, target);
+      }
+      return true;
+    }
+
+    document.getElementById("board").addEventListener(
+      "touchmove",
+      (event) => event.preventDefault(),
+      { passive: false }
+    );
+    document.getElementById("board").addEventListener("click", (event) => {
+      if (waitingForEngine || promotionResolver) {
+        return;
+      }
+
+      const square = squareFromElement(event.target.closest(".square-55d63"));
+      if (!square) {
+        return;
+      }
+
+      if (selectedSquare === square) {
+        clearSelection();
+        return;
+      }
+      if (attemptSelectedMove(square)) {
+        return;
+      }
+
+      if (selectedSquare) {
+        clearSelection();
+        return;
+      }
+
+      const piece = game.get(square);
+      if (piece && piece.color === playerColor && game.turn() === playerColor) {
+        selectSquare(square);
+      } else {
+        clearSelection();
       }
     });
 
@@ -578,61 +802,27 @@
         return "snapback";
       }
 
-      const previousFen = game.fen();
-      const movingPiece = game.get(source);
-      const isPromotion = movingPiece &&
-        movingPiece.type === "p" &&
-        ((movingPiece.color === "w" && target.charAt(1) === "8") ||
-          (movingPiece.color === "b" && target.charAt(1) === "1")) &&
-        game.moves({ square: source, verbose: true }).some((candidate) =>
-          candidate.to === target && Boolean(candidate.promotion)
-        );
+      clearSelection();
 
-      if (isPromotion) {
-        showPromotionPicker(movingPiece.color).then((promotion) => {
-          if (!promotion || waitingForEngine) {
-            return;
-          }
-          const move = game.move({
-            from: source,
-            to: target,
-            promotion: promotion
-          });
-          if (!move) {
-            board.position(game.fen());
-            return;
-          }
-          board.position(game.fen());
-          fenElement.textContent = game.fen();
-          renderPlayerInfo();
-          if (game.game_over()) {
-            finishGame();
+      if (isPromotionMove(source, target)) {
+        showPromotionPicker(playerColor).then((promotion) => {
+          if (promotion && !waitingForEngine) {
+            completePlayerMove(source, target, promotion);
           } else {
-            requestEngineMove(previousFen);
+            board.position(game.fen());
           }
         });
         return "snapback";
       }
 
-      const move = game.move({
-        from: source,
-        to: target,
-        promotion: "q"
-      });
-
-      if (move === null) {
+      if (!game.moves({ square: source, verbose: true }).some((move) =>
+        move.to === target
+      )) {
+        clearSelection();
         return "snapback";
       }
 
-      fenElement.textContent = game.fen();
-      renderPlayerInfo();
-      if (game.game_over()) {
-        board.position(game.fen());
-        finishGame();
-        return;
-      }
-
-      requestEngineMove(previousFen);
+      completePlayerMove(source, target);
     }
 
     function startNewGame() {
@@ -646,6 +836,7 @@
         : selectedColor === "black" ? "b" : "w";
 
       game.reset();
+      clearSelection();
       board.position(game.fen());
       board.orientation(playerColor === "b" ? "black" : "white");
       fenElement.textContent = game.fen();
