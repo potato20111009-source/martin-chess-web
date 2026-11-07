@@ -42,20 +42,25 @@ public sealed class EngineController : ControllerBase
                 ? 400
                 : request.Simulations;
 
-        var executablePath = ResolveEnginePath();
-        if (executablePath == null)
+        var scriptPath = ResolveEngineScriptPath();
+        if (scriptPath == null)
         {
-            _logger.LogError("MartinAI executable was not found under {ContentRoot}.", _environment.ContentRootPath);
-            return StatusCode(500, new { error = "The chess engine executable was not found." });
+            _logger.LogError("MartinAI Python script (.py) was not found under {ContentRoot}.", _environment.ContentRootPath);
+            return StatusCode(500, new { error = "The chess engine script (.py) was not found." });
         }
+
+        // Linux Docker 環境使用 python3，Windows 本機測試使用 python
+        string pythonExec = OperatingSystem.IsWindows() ? "python" : "python3";
 
         using var timeout = new CancellationTokenSource(EngineTimeout);
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
-                FileName = executablePath,
-                WorkingDirectory = Path.GetDirectoryName(executablePath)!,
+                FileName = pythonExec,
+                // -u 參數強制 Python 即時輸出 (Unbuffered)，避免管道被 Buffer 擋住導致 UCI 逾時
+                Arguments = $"-u \"{scriptPath}\"",
+                WorkingDirectory = Path.GetDirectoryName(scriptPath)!,
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = true,
@@ -157,15 +162,30 @@ public sealed class EngineController : ControllerBase
         Debug.WriteLine(message);
     }
 
-    private string? ResolveEnginePath()
+    private string? ResolveEngineScriptPath()
     {
-        var paths = new[]
+        var candidatePaths = new[]
         {
-            Path.Combine(_environment.ContentRootPath, "Engine", "MartinAI", "MartinAI.exe"),
-            Path.Combine(_environment.ContentRootPath, "engines", "MartinAI", "MartinAI.exe")
+            Path.Combine(_environment.ContentRootPath, "engines", "MartinAI", "main.py"),
+            Path.Combine(_environment.ContentRootPath, "engines", "MartinAI", "MartinAI.py"),
+            Path.Combine(_environment.ContentRootPath, "engines", "MartinAI", "engine.py"),
+            Path.Combine(_environment.ContentRootPath, "engines", "MartinAI", "script.py"),
+            Path.Combine(_environment.ContentRootPath, "Engine", "MartinAI", "main.py"),
+            Path.Combine(_environment.ContentRootPath, "Engine", "MartinAI", "MartinAI.py")
         };
 
-        return paths.FirstOrDefault(System.IO.File.Exists);
+        var found = candidatePaths.FirstOrDefault(System.IO.File.Exists);
+        if (found != null) return found;
+
+        // 若上述常見檔名未匹配，自動搜尋 engines/MartinAI 目錄下的第一個 .py 檔案
+        var enginesDir = Path.Combine(_environment.ContentRootPath, "engines", "MartinAI");
+        if (Directory.Exists(enginesDir))
+        {
+            var pyFiles = Directory.GetFiles(enginesDir, "*.py");
+            return pyFiles.FirstOrDefault();
+        }
+
+        return null;
     }
 }
 
