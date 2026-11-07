@@ -183,6 +183,9 @@ from src.mcts import MCTS
 from src.persistence import load_archived_model
 
 
+HARD_SEARCH_TIME_SECONDS = 5.0
+
+
 def resolve_model_path(path: str | Path | None = None) -> Path:
     """Resolve the explicit model path or the ordered local/default candidates."""
     if path is not None:
@@ -258,17 +261,23 @@ def go_time_budget(command: str, side_to_move: chess.Color) -> float:
             index += 1
 
     if "movetime" in fields:
-        return max(0.01, fields["movetime"] / 1000.0 * 0.9)
+        return min(
+            HARD_SEARCH_TIME_SECONDS,
+            max(0.01, fields["movetime"] / 1000.0 * 0.9),
+        )
 
     clock_key = "wtime" if side_to_move == chess.WHITE else "btime"
     increment_key = "winc" if side_to_move == chess.WHITE else "binc"
     if clock_key not in fields:
-        return 1.0
+        return min(HARD_SEARCH_TIME_SECONDS, 1.0)
     moves_to_go = max(1, fields.get("movestogo", 30))
     clock_seconds = fields[clock_key] / 1000.0
     increment_seconds = fields.get(increment_key, 0) / 1000.0
     allocation = (clock_seconds / moves_to_go + increment_seconds * 0.8) * 0.8
-    return max(0.01, min(clock_seconds * 0.8, allocation))
+    return min(
+        HARD_SEARCH_TIME_SECONDS,
+        max(0.01, min(clock_seconds * 0.8, allocation)),
+    )
 
 
 def _go_simulations(command: str, configured_simulations: int) -> int:
@@ -365,22 +374,52 @@ class MartinUCI:
         try:
             if self.search is None:
                 raise RuntimeError("Model is not loaded; send isready before go.")
+            search = self.search
+            position = self.board.copy(stack=True)
             time_budget = go_time_budget(command, self.board.turn)
             simulations = _go_simulations(command, self.simulations)
             self.search.simulations = simulations
             started = time.monotonic()
-            results = self.search.search_batch(
-                [self.board.copy(stack=True)],
-                time_limit_seconds=time_budget,
+            search_result: dict[str, Any] = {}
+            search_finished = threading.Event()
+            visits: dict[Any, Any] = {}
+
+            def run_search() -> None:
+                try:
+                    search_result["results"] = search.search_batch(
+                        [position],
+                        time_limit_seconds=time_budget,
+                    )
+                except Exception as error:
+                    search_result["error"] = error
+                finally:
+                    search_finished.set()
+
+            search_thread = threading.Thread(
+                target=run_search,
+                name="martin-mcts-search",
+                daemon=True,
             )
-            visits, _ = results[0]
-            elapsed_ms = max(1, int((time.monotonic() - started) * 1000))
-            if visits:
-                best_move = max(visits.items(), key=lambda entry: entry[1])[0]
-                self._emit(f"info nodes {sum(visits.values())} time {elapsed_ms}")
-                bestmove = best_move.uci()
+            search_thread.start()
+            if not search_finished.wait(timeout=time_budget):
+                legal_moves = list(self.board.legal_moves)
+                bestmove = legal_moves[0].uci() if legal_moves else "0000"
+                self._emit(
+                    f"info string search exceeded {time_budget:.2f}s; "
+                    "returning a legal fallback move"
+                )
             else:
-                bestmove = "0000"
+                if "error" in search_result:
+                    raise search_result["error"]
+                visits, _ = search_result["results"][0]
+                if visits:
+                    best_move = max(visits.items(), key=lambda entry: entry[1])[0]
+                    bestmove = best_move.uci()
+                else:
+                    bestmove = "0000"
+            elapsed_ms = max(1, int((time.monotonic() - started) * 1000))
+            if bestmove != "0000":
+                self._emit(f"info nodes {sum(visits.values())} time {elapsed_ms}")
             if not self._suppress_bestmove.is_set():
                 self._emit(f"bestmove {bestmove}")
         except Exception as error:

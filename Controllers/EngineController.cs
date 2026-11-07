@@ -12,7 +12,7 @@ using Microsoft.Extensions.Logging;
 [Route("api")]
 public sealed class EngineController : ControllerBase
 {
-    private static readonly TimeSpan EngineTimeout = TimeSpan.FromMilliseconds(12000);
+    private static readonly TimeSpan EngineTimeout = TimeSpan.FromMilliseconds(60000);
     private readonly IWebHostEnvironment _environment;
     private readonly ILogger<EngineController> _logger;
 
