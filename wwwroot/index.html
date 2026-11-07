@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>棋盤對弈</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+  <style>
+    :root {
+      color-scheme: light;
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #f3f5f8;
+      color: #172033;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+    }
+
+    main {
+      width: min(100%, 560px);
+      padding: clamp(20px, 5vw, 36px);
+      border: 1px solid #e1e6ed;
+      border-radius: 20px;
+      background: #fff;
+      box-shadow: 0 16px 48px rgb(23 32 51 / 8%);
+    }
+
+    h1 {
+      margin: 0 0 6px;
+      font-size: 1.6rem;
+    }
+
+    .hint {
+      margin: 0 0 22px;
+      color: #647087;
+    }
+
+    .settings {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+
+    .setting {
+      display: grid;
+      flex: 1 1 130px;
+      gap: 6px;
+      color: #465269;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+
+    select,
+    button {
+      min-height: 42px;
+      padding: 8px 12px;
+      border: 1px solid #cbd3df;
+      border-radius: 8px;
+      background: #fff;
+      color: #172033;
+      font: inherit;
+    }
+
+    button {
+      flex: 1 1 130px;
+      border-color: #3157a4;
+      background: #3157a4;
+      color: #fff;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    select:disabled,
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+
+    #board {
+      width: 100%;
+      margin: 0 auto;
+    }
+
+    #status {
+      min-height: 1.5em;
+      margin: 18px 0 10px;
+      font-weight: 600;
+    }
+
+    #status[data-error="true"] {
+      color: #b42318;
+    }
+
+    details {
+      margin-top: 12px;
+      color: #647087;
+      font-size: 0.9rem;
+    }
+
+    summary {
+      cursor: pointer;
+    }
+
+    #fen {
+      overflow-wrap: anywhere;
+      margin: 8px 0 0;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>棋盤對弈</h1>
+    <p class="hint">你執白棋，拖曳棋子完成走步。</p>
+    <div class="settings">
+      <label class="setting" for="player-color">
+        陣營
+        <select id="player-color">
+          <option value="white" selected>白棋</option>
+          <option value="black">黑棋</option>
+          <option value="random">隨機</option>
+        </select>
+      </label>
+      <label class="setting" for="simulations">
+        Simulations
+        <select id="simulations">
+          <option value="100">100</option>
+          <option value="200" selected>200</option>
+          <option value="400">400</option>
+        </select>
+      </label>
+      <button id="new-game" type="button">開始新局</button>
+    </div>
+    <div id="board" aria-label="西洋棋棋盤"></div>
+    <p id="status" role="status" aria-live="polite">輪到白棋</p>
+    <details>
+      <summary>目前局面 FEN</summary>
+      <p id="fen"></p>
+    </details>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+  <script>
+    const game = new Chess();
+    const statusElement = document.getElementById("status");
+    const fenElement = document.getElementById("fen");
+    const playerColorSelect = document.getElementById("player-color");
+    const simulationsSelect = document.getElementById("simulations");
+    const newGameButton = document.getElementById("new-game");
+    let waitingForEngine = false;
+    let playerColor = "w";
+
+    const board = Chessboard("board", {
+      position: "start",
+      draggable: true,
+      pieceTheme: "https://chessboardjs.com/img/chesspieces/wikipedia/{piece}.png",
+      onDragStart: function (_source, piece) {
+        return !waitingForEngine && game.turn() === playerColor &&
+          piece.charAt(0) === playerColor && !game.game_over();
+      },
+      onDrop: onDrop,
+      onSnapEnd: function () {
+        board.position(game.fen());
+      }
+    });
+
+    function setStatus(message, isError) {
+      statusElement.textContent = message;
+      statusElement.dataset.error = String(Boolean(isError));
+    }
+
+    function setControlsDisabled(disabled) {
+      playerColorSelect.disabled = disabled;
+      simulationsSelect.disabled = disabled;
+      newGameButton.disabled = disabled;
+    }
+
+    function sideName(color) {
+      return color === "w" ? "白棋" : "黑棋";
+    }
+
+    function finishGame() {
+      if (game.in_checkmate()) {
+        setStatus(game.turn() === "w" ? "將死，黑棋獲勝。" : "將死，白棋獲勝。");
+      } else if (game.in_draw()) {
+        setStatus("和局。");
+      } else {
+        setStatus("對局結束。");
+      }
+    }
+
+    function applyEngineMove(bestMove) {
+      if (typeof bestMove !== "string" || bestMove.trim() === "") {
+        console.error("無法套用後端走步。", {
+          fen: game.fen(),
+          bestMove: bestMove
+        });
+        throw new Error("後端未提供有效的 bestMove。");
+      }
+
+      const moveText = bestMove.trim();
+      const uciMove = {
+        from: moveText.substring(0, 2),
+        to: moveText.substring(2, 4),
+        promotion: moveText.length > 4 ? moveText.substring(4, 5) : "q"
+      };
+      const expectedColor = game.turn();
+      let move;
+
+      try {
+        move = game.move(uciMove);
+      } catch (error) {
+        console.error("無法套用後端走步。", {
+          fen: game.fen(),
+          bestMove: bestMove
+        });
+        throw error;
+      }
+
+      if (!move || move.color !== expectedColor) {
+        console.error("無法套用後端走步。", {
+          fen: game.fen(),
+          bestMove: bestMove
+        });
+        throw new Error("後端回傳的 bestMove 無效。");
+      }
+    }
+
+    async function requestEngineMove(previousFen) {
+      waitingForEngine = true;
+      setControlsDisabled(true);
+      setStatus("引擎思考中…");
+      fenElement.textContent = game.fen();
+
+      try {
+        const response = await fetch("/api/move", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            fen: game.fen(),
+            simulations: parseInt(simulationsSelect.value, 10)
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error("伺服器回應錯誤（HTTP " + response.status + "）。");
+        }
+
+        const result = await response.json();
+        applyEngineMove(result.bestMove);
+        board.position(game.fen());
+        fenElement.textContent = game.fen();
+
+        if (game.game_over()) {
+          finishGame();
+        } else {
+          setStatus("輪到" + sideName(playerColor));
+        }
+      } catch (error) {
+        game.load(previousFen);
+        board.position(previousFen);
+        fenElement.textContent = previousFen;
+        setStatus("走步未完成：" + error.message + " 請再試一次。", true);
+      } finally {
+        waitingForEngine = false;
+        setControlsDisabled(false);
+      }
+    }
+
+    async function onDrop(source, target) {
+      if (waitingForEngine) {
+        return "snapback";
+      }
+
+      const previousFen = game.fen();
+      const move = game.move({
+        from: source,
+        to: target,
+        promotion: "q"
+      });
+
+      if (move === null) {
+        return "snapback";
+      }
+
+      fenElement.textContent = game.fen();
+      if (game.game_over()) {
+        board.position(game.fen());
+        finishGame();
+        return;
+      }
+
+      await requestEngineMove(previousFen);
+    }
+
+    function startNewGame() {
+      if (waitingForEngine) {
+        return;
+      }
+
+      const selectedColor = playerColorSelect.value;
+      playerColor = selectedColor === "random"
+        ? (Math.random() < 0.5 ? "w" : "b")
+        : selectedColor === "black" ? "b" : "w";
+
+      game.reset();
+      board.position(game.fen());
+      board.orientation(playerColor === "b" ? "black" : "white");
+      fenElement.textContent = game.fen();
+      setStatus("你執" + sideName(playerColor));
+      document.querySelector(".hint").textContent =
+        "你執" + sideName(playerColor) + "，拖曳棋子完成走步。";
+
+      if (playerColor === "b") {
+        requestEngineMove(game.fen());
+      }
+    }
+
+    playerColorSelect.addEventListener("change", startNewGame);
+    newGameButton.addEventListener("click", startNewGame);
+    startNewGame();
+    window.addEventListener("resize", board.resize);
+  </script>
+</body>
+</html>
