@@ -103,10 +103,14 @@
       background: #f6f669 !important;
     }
 
+    #board .square-55d63.last-move-highlight {
+      background-color: rgba(82, 179, 164, 0.6) !important;
+    }
+
     #board .legal-move-dot,
     #board .legal-move-capture {
       position: absolute;
-      z-index: 10;
+      z-index: 99;
       top: 50%;
       left: 50%;
       border-radius: 50%;
@@ -444,6 +448,8 @@
     let selectedLegalMoves = [];
     let activeTouch = null;
     let ignoreClickUntil = 0;
+    let lastMoveSquares = null;
+    const boardElement = document.getElementById("board");
 
     const board = Chessboard("board", {
       position: "start",
@@ -456,11 +462,11 @@
       onDrop: onDrop,
       onSnapEnd: function () {
         board.position(game.fen());
+        renderLastMoveHighlight();
       }
     });
 
     function clearSelection() {
-      const boardElement = document.getElementById("board");
       boardElement.querySelectorAll(
         ".click-selected, .legal-move-dot, .legal-move-capture"
       ).forEach((element) => {
@@ -474,6 +480,32 @@
       selectedSquare = null;
       selectedLegalMoves = [];
     }
+
+    function renderLastMoveHighlight() {
+      boardElement.querySelectorAll(".last-move-highlight").forEach((square) => {
+        square.classList.remove("last-move-highlight");
+      });
+      if (!lastMoveSquares) {
+        return;
+      }
+
+      [lastMoveSquares.from, lastMoveSquares.to].forEach((square) => {
+        const element = boardElement.querySelector(".square-" + square);
+        if (element) {
+          element.classList.add("last-move-highlight");
+        }
+      });
+    }
+
+    function setLastMove(from, to) {
+      lastMoveSquares = { from: from, to: to };
+      renderLastMoveHighlight();
+    }
+
+    const boardObserver = new MutationObserver(() => {
+      renderLastMoveHighlight();
+    });
+    boardObserver.observe(boardElement, { childList: true, subtree: true });
 
     function selectSquare(square) {
       clearSelection();
@@ -535,6 +567,7 @@
 
     function completePlayerMove(source, target, promotion) {
       const previousFen = game.fen();
+      const previousLastMove = lastMoveSquares;
       const move = game.move({
         from: source,
         to: target,
@@ -548,12 +581,13 @@
 
       clearSelection();
       board.position(game.fen());
+      setLastMove(move.from, move.to);
       fenElement.textContent = game.fen();
       renderPlayerInfo();
       if (game.game_over()) {
         finishGame();
       } else {
-        requestEngineMove(previousFen);
+        requestEngineMove(previousFen, previousLastMove);
       }
     }
 
@@ -577,8 +611,6 @@
       return true;
     }
 
-    const boardElement = document.getElementById("board");
-
     boardElement.addEventListener(
       "touchmove",
       (event) => {
@@ -595,13 +627,66 @@
       },
       { passive: false }
     );
+    boardElement.addEventListener("click", (event) => {
+      if (Date.now() < ignoreClickUntil) {
+        event.preventDefault();
+        return;
+      }
+      const squareElement = event.target.closest(".square-55d63");
+      if (!squareElement) {
+        clearSelection();
+        return;
+      }
+      handleBoardSelection(event, squareElement);
+    });
 
-    function handleBoardSelection(event) {
-      if (waitingForEngine || promotionResolver) {
+    boardElement.addEventListener("touchstart", (event) => {
+      const squareElement = event.target.closest(".square-55d63");
+      if (!squareElement) {
+        activeTouch = null;
+        clearSelection();
+        return;
+      }
+      if (event.touches.length !== 1) {
+        activeTouch = null;
+        return;
+      }
+      const touch = event.touches[0];
+      activeTouch = {
+        square: squareFromElement(squareElement),
+        startX: touch.clientX,
+        startY: touch.clientY,
+        moved: false
+      };
+    }, { passive: true });
+
+    boardElement.addEventListener("touchend", (event) => {
+      if (!activeTouch) {
+        return;
+      }
+      const touch = activeTouch;
+      activeTouch = null;
+      if (touch.moved) {
+        ignoreClickUntil = Date.now() + 500;
         return;
       }
 
       const squareElement = event.target.closest(".square-55d63");
+      if (squareElement && touch.square === squareFromElement(squareElement)) {
+        ignoreClickUntil = Date.now() + 500;
+        handleBoardSelection(event, squareElement);
+      }
+    }, { passive: true });
+
+    boardElement.addEventListener("touchcancel", () => {
+      activeTouch = null;
+    }, { passive: true });
+
+    function handleBoardSelection(event, squareElement) {
+      if (waitingForEngine || promotionResolver) {
+        return;
+      }
+
       const square = squareFromElement(squareElement);
       if (!square) {
         clearSelection();
@@ -623,51 +708,6 @@
         clearSelection();
       }
     }
-
-    boardElement.addEventListener("click", (event) => {
-      if (Date.now() < ignoreClickUntil) {
-        event.preventDefault();
-        return;
-      }
-      handleBoardSelection(event);
-    });
-
-    boardElement.addEventListener("touchstart", (event) => {
-      if (event.touches.length !== 1) {
-        activeTouch = null;
-        return;
-      }
-      const touch = event.touches[0];
-      activeTouch = {
-        square: squareFromElement(event.target.closest(".square-55d63")),
-        startX: touch.clientX,
-        startY: touch.clientY,
-        moved: false
-      };
-    }, { passive: true });
-
-    boardElement.addEventListener("touchend", (event) => {
-      if (!activeTouch) {
-        return;
-      }
-      const touch = activeTouch;
-      activeTouch = null;
-      if (touch.moved) {
-        ignoreClickUntil = Date.now() + 500;
-        return;
-      }
-
-      const squareElement = event.target.closest(".square-55d63");
-      const square = squareFromElement(squareElement);
-      if (square && square === touch.square) {
-        ignoreClickUntil = Date.now() + 500;
-        handleBoardSelection(event);
-      }
-    }, { passive: true });
-
-    boardElement.addEventListener("touchcancel", () => {
-      activeTouch = null;
-    }, { passive: true });
 
     function setStatus(message, isError) {
       statusElement.textContent = message;
@@ -813,9 +853,10 @@
         });
         throw new Error("後端回傳的 bestMove 無效。");
       }
+      return move;
     }
 
-    async function requestEngineMove(previousFen) {
+    async function requestEngineMove(previousFen, previousLastMove) {
       waitingForEngine = true;
       setControlsDisabled(true);
       setStatus("引擎思考中…");
@@ -838,8 +879,9 @@
         }
 
         const result = await response.json();
-        applyEngineMove(result.bestMove);
+        const engineMove = applyEngineMove(result.bestMove);
         board.position(game.fen());
+        setLastMove(engineMove.from, engineMove.to);
         fenElement.textContent = game.fen();
         renderPlayerInfo();
 
@@ -851,6 +893,8 @@
       } catch (error) {
         game.load(previousFen);
         board.position(previousFen);
+        lastMoveSquares = previousLastMove || null;
+        renderLastMoveHighlight();
         fenElement.textContent = previousFen;
         renderPlayerInfo();
         setStatus("走步未完成：" + error.message + " 請再試一次。", true);
@@ -873,6 +917,7 @@
             completePlayerMove(source, target, promotion);
           } else {
             board.position(game.fen());
+            renderLastMoveHighlight();
           }
         });
         return "snapback";
@@ -900,7 +945,9 @@
 
       game.reset();
       clearSelection();
+      lastMoveSquares = null;
       board.position(game.fen());
+      renderLastMoveHighlight();
       board.orientation(playerColor === "b" ? "black" : "white");
       fenElement.textContent = game.fen();
       renderPlayerInfo();
