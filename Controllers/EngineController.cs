@@ -4,7 +4,6 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 
@@ -13,14 +12,10 @@ using Microsoft.Extensions.Logging;
 public sealed class EngineController : ControllerBase
 {
     private static readonly TimeSpan EngineTimeout = TimeSpan.FromMilliseconds(60000);
-    private readonly IWebHostEnvironment _environment;
     private readonly ILogger<EngineController> _logger;
 
-    public EngineController(
-        IWebHostEnvironment environment,
-        ILogger<EngineController> logger)
+    public EngineController(ILogger<EngineController> logger)
     {
-        _environment = environment;
         _logger = logger;
     }
 
@@ -42,25 +37,25 @@ public sealed class EngineController : ControllerBase
                 ? 400
                 : request.Simulations;
 
-        var scriptPath = ResolveEngineScriptPath();
-        if (scriptPath == null)
+        var workingDirectory = Path.Combine(
+            Directory.GetCurrentDirectory(),
+            "engines",
+            "MartinAI");
+        var scriptPath = Path.Combine(workingDirectory, "uci.py");
+        if (!System.IO.File.Exists(scriptPath))
         {
-            _logger.LogError("MartinAI Python script (.py) was not found under {ContentRoot}.", _environment.ContentRootPath);
-            return StatusCode(500, new { error = "The chess engine script (.py) was not found." });
+            _logger.LogError("MartinAI Python script was not found at {ScriptPath}.", scriptPath);
+            return StatusCode(500, new { error = "The chess engine script was not found." });
         }
-
-        // Linux Docker 環境使用 python3，Windows 本機測試使用 python
-        string pythonExec = OperatingSystem.IsWindows() ? "python" : "python3";
 
         using var timeout = new CancellationTokenSource(EngineTimeout);
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
-                FileName = pythonExec,
-                // -u 參數強制 Python 即時輸出 (Unbuffered)，避免管道被 Buffer 擋住導致 UCI 逾時
-                Arguments = $"-u \"{scriptPath}\"",
-                WorkingDirectory = Path.GetDirectoryName(scriptPath)!,
+                FileName = "python3",
+                Arguments = "uci.py",
+                WorkingDirectory = workingDirectory,
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 RedirectStandardInput = true,
@@ -81,17 +76,21 @@ public sealed class EngineController : ControllerBase
             var standardErrorTask = process.StandardError.ReadToEndAsync();
             await process.StandardInput.WriteLineAsync("uci");
             await process.StandardInput.FlushAsync();
-            await ReadUntilAsync(process, "uciok", timeout.Token);
+            await ReadUntilAsync(process, "uciok", standardErrorTask, timeout.Token);
 
             await process.StandardInput.WriteLineAsync("isready");
             await process.StandardInput.FlushAsync();
-            await ReadUntilAsync(process, "readyok", timeout.Token);
+            await ReadUntilAsync(process, "readyok", standardErrorTask, timeout.Token);
 
             await process.StandardInput.WriteAsync($"position fen {request.Fen}\n");
             await process.StandardInput.WriteAsync($"go nodes {simulations}\n");
             await process.StandardInput.FlushAsync();
 
-            var bestMoveLine = await ReadUntilAsync(process, "bestmove ", timeout.Token);
+            var bestMoveLine = await ReadUntilAsync(
+                process,
+                "bestmove ",
+                standardErrorTask,
+                timeout.Token);
             WriteDiagnostic($"MartinAI raw bestmove output: {bestMoveLine}");
             var bestMove = bestMoveLine.Substring("bestmove ".Length)
                 .Split(' ', StringSplitOptions.RemoveEmptyEntries)
@@ -136,6 +135,7 @@ public sealed class EngineController : ControllerBase
     private static async Task<string> ReadUntilAsync(
         Process process,
         string expectedLine,
+        Task<string> standardErrorTask,
         CancellationToken cancellationToken)
     {
         while (true)
@@ -143,8 +143,12 @@ public sealed class EngineController : ControllerBase
             var line = await process.StandardOutput.ReadLineAsync().WaitAsync(cancellationToken);
             if (line == null)
             {
+                if (!process.HasExited)
+                    await process.WaitForExitAsync(cancellationToken);
+                var standardError = await standardErrorTask;
                 throw new InvalidOperationException(
-                    $"The chess engine exited before returning '{expectedLine}'.");
+                    $"Chess engine exited before returning '{expectedLine}'. " +
+                    $"Exit code: {process.ExitCode}. stderr: {standardError}");
             }
 
             if (expectedLine.EndsWith(" ", StringComparison.Ordinal)
@@ -160,32 +164,6 @@ public sealed class EngineController : ControllerBase
     {
         Console.WriteLine(message);
         Debug.WriteLine(message);
-    }
-
-    private string? ResolveEngineScriptPath()
-    {
-        var candidatePaths = new[]
-        {
-            Path.Combine(_environment.ContentRootPath, "engines", "MartinAI", "main.py"),
-            Path.Combine(_environment.ContentRootPath, "engines", "MartinAI", "MartinAI.py"),
-            Path.Combine(_environment.ContentRootPath, "engines", "MartinAI", "engine.py"),
-            Path.Combine(_environment.ContentRootPath, "engines", "MartinAI", "script.py"),
-            Path.Combine(_environment.ContentRootPath, "Engine", "MartinAI", "main.py"),
-            Path.Combine(_environment.ContentRootPath, "Engine", "MartinAI", "MartinAI.py")
-        };
-
-        var found = candidatePaths.FirstOrDefault(System.IO.File.Exists);
-        if (found != null) return found;
-
-        // 若上述常見檔名未匹配，自動搜尋 engines/MartinAI 目錄下的第一個 .py 檔案
-        var enginesDir = Path.Combine(_environment.ContentRootPath, "engines", "MartinAI");
-        if (Directory.Exists(enginesDir))
-        {
-            var pyFiles = Directory.GetFiles(enginesDir, "*.py");
-            return pyFiles.FirstOrDefault();
-        }
-
-        return null;
     }
 }
 
