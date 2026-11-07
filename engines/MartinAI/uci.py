@@ -12,7 +12,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-sys.path.append(str(Path(__file__).resolve().parent))
+ENGINE_DIR = Path(__file__).resolve().parent
+if str(ENGINE_DIR) not in sys.path:
+    sys.path.insert(0, str(ENGINE_DIR))
+MODEL_PATH = ENGINE_DIR / "model_anchor.onnx"
 
 
 def _runtime_paths() -> tuple[
@@ -145,6 +148,7 @@ def _model_candidates(
     project_root: Path,
 ) -> tuple[Path, ...]:
     candidates: list[Path] = []
+    candidates.append(MODEL_PATH)
     if frozen:
         internal_dir = executable_dir / "_internal"
         candidates.extend(
@@ -157,6 +161,7 @@ def _model_candidates(
         )
     candidates.extend(
         (
+            project_root / "model.onnx",
             project_root / "_internal" / "exports" / "model_anchor.onnx",
             project_root / "_internal" / "exports" / "model.onnx",
             executable_dir / "_internal" / "exports" / "model_anchor.onnx",
@@ -199,7 +204,9 @@ def resolve_model_path(path: str | Path | None = None) -> Path:
         if candidate.is_file():
             return candidate.resolve()
     searched = "\n".join(f"  - {candidate}" for candidate in DEFAULT_MODEL_CANDIDATES)
-    raise FileNotFoundError(f"No UCI model found. Searched:\n{searched}")
+    raise FileNotFoundError(
+        f"ONNX/checkpoint model not found. Expected {MODEL_PATH} or one of:\n{searched}"
+    )
 
 
 def parse_position_command(command: str) -> chess.Board:
@@ -523,7 +530,7 @@ def main(argv: list[str] | None = None) -> int:
         engine = MartinUCI(args.model_path, args.device, args.simulations)
         engine.run()
     except Exception as error:
-        print(f"info string fatal error: {error}", flush=True)
+        print(f"MartinAI startup failed: {error}", file=sys.stderr, flush=True)
         return 1
     return 0
 
