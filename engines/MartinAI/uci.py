@@ -9,6 +9,7 @@ import shutil
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -302,6 +303,11 @@ def _go_simulations(command: str, configured_simulations: int) -> int:
     return min([configured_simulations, *limits]) if limits else configured_simulations
 
 
+def _fallback_uci_move(board: chess.Board) -> str:
+    legal_moves = list(board.legal_moves)
+    return legal_moves[0].uci() if legal_moves else "0000"
+
+
 class MartinUCI:
     def __init__(
         self,
@@ -378,11 +384,13 @@ class MartinUCI:
                 )
 
     def _finish_search(self, command: str) -> None:
+        position = self.board.copy(stack=True)
+        legal_moves = list(position.legal_moves)
+        fallback_move = legal_moves[0].uci() if legal_moves else "0000"
         try:
             if self.search is None:
                 raise RuntimeError("Model is not loaded; send isready before go.")
             search = self.search
-            position = self.board.copy(stack=True)
             time_budget = go_time_budget(command, self.board.turn)
             simulations = _go_simulations(command, self.simulations)
             self.search.simulations = simulations
@@ -409,8 +417,7 @@ class MartinUCI:
             )
             search_thread.start()
             if not search_finished.wait(timeout=time_budget):
-                legal_moves = list(self.board.legal_moves)
-                bestmove = legal_moves[0].uci() if legal_moves else "0000"
+                bestmove = fallback_move
                 self._emit(
                     f"info string search exceeded {time_budget:.2f}s; "
                     "returning a legal fallback move"
@@ -421,18 +428,27 @@ class MartinUCI:
                 visits, _ = search_result["results"][0]
                 if visits:
                     best_move = max(visits.items(), key=lambda entry: entry[1])[0]
-                    bestmove = best_move.uci()
+                    candidate = best_move.uci()
+                    bestmove = (
+                        candidate
+                        if any(candidate == move.uci() for move in legal_moves)
+                        else fallback_move
+                    )
                 else:
-                    bestmove = "0000"
+                    bestmove = fallback_move
             elapsed_ms = max(1, int((time.monotonic() - started) * 1000))
-            if bestmove != "0000":
+            if visits:
                 self._emit(f"info nodes {sum(visits.values())} time {elapsed_ms}")
             if not self._suppress_bestmove.is_set():
                 self._emit(f"bestmove {bestmove}")
-        except Exception as error:
-            self._emit(f"info string error: {error}")
+        except Exception as e:
+            print(f"[ERROR] MCTS search failed: {e}", file=sys.stderr)
+            print(traceback.format_exc(), file=sys.stderr)
+            sys.stderr.flush()
+            bestmove = fallback_move
+            self._emit(f"info string error: {e}")
             if not self._suppress_bestmove.is_set():
-                self._emit("bestmove 0000")
+                self._emit(f"bestmove {bestmove}")
         finally:
             self._search_thread = None
 
@@ -440,7 +456,7 @@ class MartinUCI:
         self._stop_search(suppress_output=True)
         if self.search is None:
             self._emit("info string error: Model is not loaded; send isready first.")
-            self._emit("bestmove 0000")
+            self._emit(f"bestmove {_fallback_uci_move(self.board)}")
             return
         self._stop_requested.clear()
         self._suppress_bestmove.clear()
