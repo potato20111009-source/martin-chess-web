@@ -10,6 +10,7 @@ WORKDIR /app
 
 # 安裝 Python 3 及 AI 模型推論套件 (ONNX Runtime / NumPy / Chess)
 RUN apt-get update && apt-get install -y python3 python3-pip && \
+    pip3 install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu --break-system-packages && \
     pip3 install --no-cache-dir onnxruntime numpy python-chess --break-system-packages && \
     rm -rf /var/lib/apt/lists/*
 
