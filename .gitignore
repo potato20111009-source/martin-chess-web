@@ -4,3 +4,16 @@ publish/
 *.dll
 *.exe
 *.pdb
+
+# Training logs, games, checkpoints, and exported models
+pgn_logs/
+logs/
+checkpoints/
+archived_models/
+*.pt
+*.onnx
+*.pgn
+
+# IDE metadata
+.vs/
+.idea/

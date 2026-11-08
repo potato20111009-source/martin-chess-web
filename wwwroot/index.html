@@ -608,11 +608,6 @@
       }
     }
 
-    const boardObserver = new MutationObserver(() => {
-      renderLastMoveHighlight();
-    });
-    boardObserver.observe(boardElement, { childList: true, subtree: true });
-
     function selectSquare(square) {
       clearSelection();
       const piece = game.get(square);
