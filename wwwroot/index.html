@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>棋盤對弈</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css?v=2.0">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css?v=3.0">
   <style>
     :root {
       color-scheme: light;
@@ -107,6 +107,43 @@
 
     #board .square-55d63.last-move-highlight {
       background-color: rgba(82, 179, 164, 0.6) !important;
+    }
+
+    #board [data-square].king-in-check {
+      background: radial-gradient(
+        ellipse at center,
+        rgba(255, 0, 0, 0.85) 0%,
+        rgba(231, 76, 60, 0.5) 50%,
+        rgba(0, 0, 0, 0) 100%
+      ) !important;
+    }
+
+    #board .checkmate-badge {
+      position: absolute !important;
+      width: 20px !important;
+      height: 20px !important;
+      border-radius: 50% !important;
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      font-size: 11px !important;
+      z-index: 10000 !important;
+      box-shadow: 0 2px 5px rgba(0, 0, 0, 0.5) !important;
+      pointer-events: none !important;
+    }
+
+    #board .checkmate-badge.defeated {
+      top: -4px !important;
+      right: -4px !important;
+      background-color: #cc0000 !important;
+      color: #ffffff !important;
+    }
+
+    #board .checkmate-badge.winner {
+      bottom: -4px !important;
+      right: -4px !important;
+      background-color: #2ecc71 !important;
+      color: #ffffff !important;
     }
 
     #board .legal-move-dot,
@@ -415,9 +452,9 @@
     </section>
   </div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js?v=2.0"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js?v=2.0"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js?v=2.0"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js?v=3.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js?v=3.0"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js?v=3.0"></script>
   <script>
     const game = new Chess();
     const statusElement = document.getElementById("status");
@@ -505,6 +542,70 @@
     function setLastMove(from, to) {
       lastMoveSquares = { from: from, to: to };
       renderLastMoveHighlight();
+    }
+
+    function findKingSquare(color) {
+      const position = game.board();
+      for (let row = 0; row < position.length; row += 1) {
+        for (let column = 0; column < position[row].length; column += 1) {
+          const piece = position[row][column];
+          if (piece && piece.type === "k" && piece.color === color) {
+            return String.fromCharCode(97 + column) + (8 - row);
+          }
+        }
+      }
+      return null;
+    }
+
+    function appendCheckmateBadge(square, role) {
+      const squareElement = boardElement.querySelector(
+        '[data-square="' + square + '"]'
+      );
+      if (!squareElement) {
+        return;
+      }
+
+      const badge = document.createElement("div");
+      badge.className = "checkmate-badge " + role;
+      badge.textContent = "👑";
+      badge.setAttribute("aria-label", role === "defeated" ? "將殺" : "勝利");
+      squareElement.appendChild(badge);
+    }
+
+    function renderCheckState() {
+      boardElement.querySelectorAll(".king-in-check").forEach((square) => {
+        square.classList.remove("king-in-check");
+      });
+      boardElement.querySelectorAll(".checkmate-badge").forEach((badge) => {
+        badge.remove();
+      });
+
+      if (!game.in_check()) {
+        return;
+      }
+
+      const defeatedColor = game.turn();
+      const defeatedKingSquare = findKingSquare(defeatedColor);
+      if (!defeatedKingSquare) {
+        return;
+      }
+
+      const defeatedKing = boardElement.querySelector(
+        '[data-square="' + defeatedKingSquare + '"]'
+      );
+      if (defeatedKing) {
+        defeatedKing.classList.add("king-in-check");
+      }
+
+      if (game.in_checkmate()) {
+        appendCheckmateBadge(defeatedKingSquare, "defeated");
+        const winnerKingSquare = findKingSquare(
+          defeatedColor === "w" ? "b" : "w"
+        );
+        if (winnerKingSquare) {
+          appendCheckmateBadge(winnerKingSquare, "winner");
+        }
+      }
     }
 
     const boardObserver = new MutationObserver(() => {
@@ -596,6 +697,7 @@
       clearSelection();
       board.position(game.fen());
       setLastMove(move.from, move.to);
+      renderCheckState();
       fenElement.textContent = game.fen();
       renderPlayerInfo();
       if (game.game_over()) {
@@ -896,6 +998,7 @@
         const engineMove = applyEngineMove(result.bestMove);
         board.position(game.fen());
         setLastMove(engineMove.from, engineMove.to);
+        renderCheckState();
         fenElement.textContent = game.fen();
         renderPlayerInfo();
 
@@ -909,6 +1012,7 @@
         board.position(previousFen);
         lastMoveSquares = previousLastMove || null;
         renderLastMoveHighlight();
+        renderCheckState();
         fenElement.textContent = previousFen;
         renderPlayerInfo();
         setStatus("走步未完成：" + error.message + " 請再試一次。", true);
@@ -962,6 +1066,7 @@
       lastMoveSquares = null;
       board.position(game.fen());
       renderLastMoveHighlight();
+      renderCheckState();
       board.orientation(playerColor === "b" ? "black" : "white");
       fenElement.textContent = game.fen();
       renderPlayerInfo();
