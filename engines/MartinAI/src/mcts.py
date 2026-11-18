@@ -316,6 +316,9 @@ class MCTS:
         boards: list[chess.Board],
         add_root_noise: bool = False,
         time_limit_seconds: float | None = None,
+        progress_callback: Callable[
+            [int, dict[chess.Move, int]], None
+        ] | None = None,
     ) -> list[tuple[dict[chess.Move, int], np.ndarray]]:
         """Search multiple independent roots while batching every neural inference."""
         
@@ -397,8 +400,7 @@ class MCTS:
 
             for simulation_index in range(self.simulations):
                 if (
-                    simulation_index > 0
-                    and time_limit_seconds is not None
+                    time_limit_seconds is not None
                     and time.monotonic() - search_started >= time_limit_seconds
                 ):
                     break
@@ -454,6 +456,16 @@ class MCTS:
                         self._backup(path, value, self.value_discount)
                         for _ in range(pushed_moves):
                             leaf_board.pop()
+
+                if progress_callback is not None:
+                    for result_index, _, root in roots:
+                        progress_callback(
+                            result_index,
+                            {
+                                move: child.visits
+                                for move, child in root.children.items()
+                            },
+                        )
 
                 if all(
                     root.visits >= self.simulations

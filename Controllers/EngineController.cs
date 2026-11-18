@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -25,9 +26,11 @@ public sealed class EngineController : ControllerBase
         if (request == null ||
             string.IsNullOrWhiteSpace(request.Fen) ||
             request.Fen.Length > 256 ||
-            request.Fen.Any(char.IsControl))
+            request.Fen.Any(char.IsControl) ||
+            request.Moves is { Count: > 1024 } ||
+            (request.Moves?.Any(move => !IsValidUciMove(move)) ?? false))
         {
-            return BadRequest(new { error = "A valid FEN string is required." });
+            return BadRequest(new { error = "A valid FEN and optional UCI move history are required." });
         }
 
         WriteDiagnostic($"Received FEN: {request.Fen}");
@@ -82,7 +85,10 @@ public sealed class EngineController : ControllerBase
             await process.StandardInput.FlushAsync();
             await ReadUntilAsync(process, "readyok", standardErrorTask, timeout.Token);
 
-            await process.StandardInput.WriteAsync($"position fen {request.Fen}\n");
+            var positionCommand = request.Moves is { Count: > 0 }
+                ? $"position startpos moves {string.Join(" ", request.Moves)}\n"
+                : $"position fen {request.Fen}\n";
+            await process.StandardInput.WriteAsync(positionCommand);
             await process.StandardInput.WriteAsync($"go nodes {simulations}\n");
             await process.StandardInput.FlushAsync();
 
@@ -165,10 +171,27 @@ public sealed class EngineController : ControllerBase
         Console.WriteLine(message);
         Debug.WriteLine(message);
     }
+
+    private static bool IsValidUciMove(string? move)
+    {
+        if (move is null || (move.Length != 4 && move.Length != 5))
+        {
+            return false;
+        }
+
+        var validSquares =
+            move[0] is >= 'a' and <= 'h' &&
+            move[1] is >= '1' and <= '8' &&
+            move[2] is >= 'a' and <= 'h' &&
+            move[3] is >= '1' and <= '8';
+        return validSquares &&
+            (move.Length == 4 || move[4] is 'q' or 'r' or 'b' or 'n');
+    }
 }
 
 public sealed class MoveRequest
 {
     public string? Fen { get; set; }
     public int Simulations { get; set; } = 200;
+    public List<string>? Moves { get; set; }
 }

@@ -981,7 +981,10 @@
           },
           body: JSON.stringify({
             fen: game.fen(),
-            simulations: parseInt(simulationsSelect.value, 10)
+            simulations: parseInt(simulationsSelect.value, 10),
+            moves: game.history({ verbose: true }).map(function (move) {
+              return move.from + move.to + (move.promotion || "");
+            })
           })
         });
 

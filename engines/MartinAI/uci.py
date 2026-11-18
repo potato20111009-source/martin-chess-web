@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import random
 import shutil
 import sys
 import threading
@@ -167,9 +168,12 @@ import numpy as np
 import onnxruntime as ort
 
 from src.mcts import MCTS
+from src.encoding import move_to_action
 
 
-HARD_SEARCH_TIME_SECONDS = 5.0
+HARD_SEARCH_TIME_SECONDS = 20.0
+DEFAULT_SEARCH_TIME_SECONDS = 15.0
+SEARCH_COMPLETION_GRACE_SECONDS = 5.0
 
 
 def resolve_model_path(path: str | Path | None = None) -> Path:
@@ -257,7 +261,7 @@ def go_time_budget(command: str, side_to_move: chess.Color) -> float:
     clock_key = "wtime" if side_to_move == chess.WHITE else "btime"
     increment_key = "winc" if side_to_move == chess.WHITE else "binc"
     if clock_key not in fields:
-        return min(HARD_SEARCH_TIME_SECONDS, 1.0)
+        return min(HARD_SEARCH_TIME_SECONDS, DEFAULT_SEARCH_TIME_SECONDS)
     moves_to_go = max(1, fields.get("movestogo", 30))
     clock_seconds = fields[clock_key] / 1000.0
     increment_seconds = fields.get(increment_key, 0) / 1000.0
@@ -283,9 +287,93 @@ def _go_simulations(command: str, configured_simulations: int) -> int:
     return min([configured_simulations, *limits]) if limits else configured_simulations
 
 
+def _move_causes_repetition(board: chess.Board, move: chess.Move) -> bool:
+    if not board.move_stack:
+        return False
+    board.push(move)
+    try:
+        return board.is_repetition(2)
+    finally:
+        board.pop()
+
+
+def _best_scored_legal_move(
+    board: chess.Board,
+    scored_moves: list[tuple[float, chess.Move]],
+) -> chess.Move | None:
+    legal_moves = set(board.legal_moves)
+    ranked_moves = sorted(
+        (
+            (score, move)
+            for score, move in scored_moves
+            if move in legal_moves and np.isfinite(score)
+        ),
+        key=lambda item: item[0],
+        reverse=True,
+    )
+    if not ranked_moves:
+        return None
+
+    non_repeating_moves: list[chess.Move] = []
+    repeating_moves: list[chess.Move] = []
+    for _, move in ranked_moves:
+        if _move_causes_repetition(board, move):
+            repeating_moves.append(move)
+        else:
+            non_repeating_moves.append(move)
+    return (non_repeating_moves or repeating_moves)[0]
+
+
+def _select_fallback_move(
+    board: chess.Board,
+    visits: dict[chess.Move, int],
+    search: MCTS | None,
+) -> tuple[str, str]:
+    if any(count > 0 for count in visits.values()):
+        root_moves = [
+            (float(count), move)
+            for move, count in visits.items()
+        ]
+        best_move = _best_scored_legal_move(board, root_moves)
+        if best_move is not None:
+            return best_move.uci(), "mcts"
+
+    if search is not None:
+        try:
+            policy, _ = search._predict(board)
+            policy = np.asarray(policy).reshape(-1)
+            policy_moves = [
+                (float(policy[move_to_action(move)]), move)
+                for move in board.legal_moves
+                if move_to_action(move) < policy.size
+            ]
+            best_move = _best_scored_legal_move(board, policy_moves)
+            if best_move is not None:
+                return best_move.uci(), "policy"
+        except Exception as error:
+            print(
+                f"[WARN] Policy fallback inference failed: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    legal_moves = list(board.legal_moves)
+    if not legal_moves:
+        return "0000", "none"
+    non_repeating_moves = [
+        move for move in legal_moves if not _move_causes_repetition(board, move)
+    ]
+    return random.choice(non_repeating_moves or legal_moves).uci(), "random"
+
+
 def _fallback_uci_move(board: chess.Board) -> str:
     legal_moves = list(board.legal_moves)
-    return legal_moves[0].uci() if legal_moves else "0000"
+    if not legal_moves:
+        return "0000"
+    non_repeating_moves = [
+        move for move in legal_moves if not _move_causes_repetition(board, move)
+    ]
+    return random.choice(non_repeating_moves or legal_moves).uci()
 
 
 class MartinUCI:
@@ -368,15 +456,17 @@ class MartinUCI:
     def _finish_search(self, command: str) -> None:
         position = self.board.copy(stack=True)
         legal_moves = list(position.legal_moves)
-        fallback_move = legal_moves[0].uci() if legal_moves else "0000"
+        fallback_move = _fallback_uci_move(position)
+        search: MCTS | None = self.search
+        progress_lock = threading.Lock()
+        progress_visits: dict[chess.Move, int] = {}
+        started = time.monotonic()
         try:
-            if self.search is None:
+            if search is None:
                 raise RuntimeError("Model is not loaded; send isready before go.")
-            search = self.search
             time_budget = go_time_budget(command, self.board.turn)
             simulations = _go_simulations(command, self.simulations)
-            self.search.simulations = simulations
-            started = time.monotonic()
+            search.simulations = simulations
             mate_move = MCTS.find_mate_in_one(position)
             if mate_move is not None:
                 self._emit("info string mate-in-one root fast path")
@@ -388,11 +478,22 @@ class MartinUCI:
             search_finished = threading.Event()
             visits: dict[Any, Any] = {}
 
+            def save_progress(
+                root_index: int,
+                current_visits: dict[chess.Move, int],
+            ) -> None:
+                if root_index != 0:
+                    return
+                with progress_lock:
+                    progress_visits.clear()
+                    progress_visits.update(current_visits)
+
             def run_search() -> None:
                 try:
                     search_result["results"] = search.search_batch(
                         [position],
                         time_limit_seconds=time_budget,
+                        progress_callback=save_progress,
                     )
                 except Exception as error:
                     search_result["error"] = error
@@ -405,17 +506,24 @@ class MartinUCI:
                 daemon=True,
             )
             search_thread.start()
-            if not search_finished.wait(timeout=time_budget):
-                bestmove = fallback_move
+            wait_budget = time_budget + SEARCH_COMPLETION_GRACE_SECONDS
+            if not search_finished.wait(timeout=wait_budget):
+                with progress_lock:
+                    current_visits = dict(progress_visits)
+                bestmove, fallback_source = _select_fallback_move(
+                    position, current_visits, search
+                )
+                elapsed_ms = max(1, int((time.monotonic() - started) * 1000))
                 self._emit(
-                    f"info string search exceeded {time_budget:.2f}s; "
-                    "returning a legal fallback move"
+                    f"info string fallback ply={len(position.move_stack)} "
+                    f"elapsed_ms={elapsed_ms} reason=search-timeout "
+                    f"source={fallback_source} move={bestmove}"
                 )
             else:
                 if "error" in search_result:
                     raise search_result["error"]
                 visits, _ = search_result["results"][0]
-                if visits:
+                if visits and any(count > 0 for count in visits.values()):
                     best_move = max(visits.items(), key=lambda entry: entry[1])[0]
                     candidate = best_move.uci()
                     bestmove = (
@@ -424,7 +532,15 @@ class MartinUCI:
                         else fallback_move
                     )
                 else:
-                    bestmove = fallback_move
+                    bestmove, fallback_source = _select_fallback_move(
+                        position, visits, search
+                    )
+                    elapsed_ms = max(1, int((time.monotonic() - started) * 1000))
+                    self._emit(
+                        f"info string fallback ply={len(position.move_stack)} "
+                        f"elapsed_ms={elapsed_ms} reason=no-search-visits "
+                        f"source={fallback_source} move={bestmove}"
+                    )
             elapsed_ms = max(1, int((time.monotonic() - started) * 1000))
             if visits:
                 self._emit(f"info nodes {sum(visits.values())} time {elapsed_ms}")
@@ -434,8 +550,18 @@ class MartinUCI:
             print(f"[CRITICAL MCTS ERROR] {e}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
             sys.stderr.flush()
-            bestmove = fallback_move
+            with progress_lock:
+                current_visits = dict(progress_visits)
+            bestmove, fallback_source = _select_fallback_move(
+                position, current_visits, search
+            )
+            elapsed_ms = max(1, int((time.monotonic() - started) * 1000))
             self._emit(f"info string error: {e}")
+            self._emit(
+                f"info string fallback ply={len(position.move_stack)} "
+                f"elapsed_ms={elapsed_ms} reason=search-error "
+                f"source={fallback_source} move={bestmove}"
+            )
             if not self._suppress_bestmove.is_set():
                 self._emit(f"bestmove {bestmove}")
         finally:
