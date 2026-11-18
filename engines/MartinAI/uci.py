@@ -377,6 +377,13 @@ class MartinUCI:
             simulations = _go_simulations(command, self.simulations)
             self.search.simulations = simulations
             started = time.monotonic()
+            mate_move = MCTS.find_mate_in_one(position)
+            if mate_move is not None:
+                self._emit("info string mate-in-one root fast path")
+                if not self._suppress_bestmove.is_set():
+                    self._emit(f"bestmove {mate_move.uci()}")
+                return
+
             search_result: dict[str, Any] = {}
             search_finished = threading.Event()
             visits: dict[Any, Any] = {}

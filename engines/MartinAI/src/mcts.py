@@ -204,9 +204,13 @@ class MCTS:
     def find_mate_in_one(board: chess.Board) -> chess.Move | None:
         """Return a legal move that checkmates immediately, if one exists."""
         for move in list(board.legal_moves):
+            if not board.gives_check(move):
+                continue
             board.push(move)
-            is_mate = board.is_checkmate()
-            board.pop()
+            try:
+                is_mate = board.is_checkmate()
+            finally:
+                board.pop()
             if is_mate:
                 return move
         return None
